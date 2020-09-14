@@ -6,6 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containers/common/pkg/config"
+	"github.com/containers/image/v5/storage"
+	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/libpod/v2/cmd/podman/common"
 	"github.com/containers/libpod/v2/cmd/podman/registry"
 	"github.com/containers/libpod/v2/libpod/define"
@@ -129,7 +132,7 @@ func rrun(cmd *cobra.Command, args []string) error {
 
 	imageName := args[0]
 	if !cliVals.RootFS {
-		name, err := pullImage(args[0])
+		name, err := pullRImage(args[0])
 		if err != nil {
 			return err
 		}
@@ -208,4 +211,44 @@ func rrun(cmd *cobra.Command, args []string) error {
 		}
 	}
 	return nil
+}
+
+func pullRImage(imageName string) (string, error) {
+	pullPolicy, err := config.ValidatePullPolicy(cliVals.Pull)
+	if err != nil {
+		return "", err
+	}
+
+	// Check if the image is missing and hence if we need to pull it.
+	imageMissing := true
+	imageRef, err := alltransports.ParseImageName(imageName)
+	switch {
+	case err != nil:
+		// Assume we specified a local image withouth the explicit storage transport.
+		fallthrough
+
+	case imageRef.Transport().Name() == storage.Transport.Name():
+		br, err := registry.ImageEngine().Exists(registry.GetContext(), imageName)
+		if err != nil {
+			return "", err
+		}
+		imageMissing = !br.Value
+	}
+
+	if imageMissing || pullPolicy == config.PullImageAlways {
+		if pullPolicy == config.PullImageNever {
+			return "", errors.Wrapf(define.ErrNoSuchImage, "unable to find a name and tag match for %s in repotags", imageName)
+		}
+		pullReport, pullErr := registry.ImageEngine().Pull(registry.GetContext(), imageName, entities.ImagePullOptions{
+			Authfile:     cliVals.Authfile,
+			Quiet:        cliVals.Quiet,
+			OverrideArch: cliVals.OverrideArch,
+			OverrideOS:   cliVals.OverrideOS,
+		})
+		if pullErr != nil {
+			return "", pullErr
+		}
+		imageName = pullReport.Images[0]
+	}
+	return imageName, nil
 }
