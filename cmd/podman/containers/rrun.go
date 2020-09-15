@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -12,10 +13,14 @@ import (
 	"github.com/containers/libpod/v2/cmd/podman/common"
 	"github.com/containers/libpod/v2/cmd/podman/registry"
 	"github.com/containers/libpod/v2/libpod/define"
+	"github.com/containers/libpod/v2/libpod/events"
 	"github.com/containers/libpod/v2/pkg/domain/entities"
+	"github.com/containers/libpod/v2/pkg/domain/infra/abi"
+	"github.com/containers/libpod/v2/pkg/domain/infra/abi/terminal"
 	"github.com/containers/libpod/v2/pkg/errorhandling"
 	"github.com/containers/libpod/v2/pkg/rootless"
 	"github.com/containers/libpod/v2/pkg/specgen"
+	"github.com/containers/libpod/v2/pkg/specgen/generate"
 	"github.com/containers/libpod/v2/pkg/util"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -184,8 +189,7 @@ func rrun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	//[TODO]: ContainerRRunを作る
-	report, err := registry.ContainerEngine().ContainerRun(registry.GetContext(), rrunOpts)
+	report, err := containerRRun(registry.GetContext(), registry.ContainerEngine(), rrunOpts)
 	// report.ExitCode is set by ContainerRun even it it returns an error
 	if report != nil {
 		registry.SetExitCode(report.ExitCode)
@@ -251,4 +255,99 @@ func pullRImage(imageName string) (string, error) {
 		imageName = pullReport.Images[0]
 	}
 	return imageName, nil
+}
+
+// [TODO]: manifestやconfigをこの関数に渡したい
+func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts entities.ContainerRunOptions) (*entities.ContainerRunReport, error) {
+	ic, ok := raw_ic.(*abi.ContainerEngine)
+	if !ok {
+		return nil, fmt.Errorf("ContainerEngine needs abi.ContainerEngine")
+	}
+
+	// [TODO]: remote imageを使うように変更
+	warn, err := generate.CompleteSpec(ctx, ic.Libpod, opts.Spec)
+	if err != nil {
+		return nil, err
+	}
+	// Print warnings
+	for _, w := range warn {
+		fmt.Fprintf(os.Stderr, "%s\n", w)
+	}
+	// [TODO]: remote imageを使うように変更
+	ctr, err := generate.MakeContainer(ctx, ic.Libpod, opts.Spec)
+	if err != nil {
+		return nil, err
+	}
+
+	var joinPod bool
+	if len(ctr.PodID()) > 0 {
+		joinPod = true
+	}
+	report := entities.ContainerRunReport{Id: ctr.ID()}
+
+	if logrus.GetLevel() == logrus.DebugLevel {
+		cgroupPath, err := ctr.CGroupPath()
+		if err == nil {
+			logrus.Debugf("container %q has CgroupParent %q", ctr.ID(), cgroupPath)
+		}
+	}
+	if opts.Detach {
+		// if the container was created as part of a pod, also start its dependencies, if any.
+		if err := ctr.Start(ctx, joinPod); err != nil {
+			// This means the command did not exist
+			report.ExitCode = define.ExitCode(err)
+			return &report, err
+		}
+
+		return &report, nil
+	}
+
+	// if the container was created as part of a pod, also start its dependencies, if any.
+	if err := terminal.StartAttachCtr(ctx, ctr, opts.OutputStream, opts.ErrorStream, opts.InputStream, opts.DetachKeys, opts.SigProxy, true, joinPod); err != nil {
+		// We've manually detached from the container
+		// Do not perform cleanup, or wait for container exit code
+		// Just exit immediately
+		if errors.Cause(err) == define.ErrDetach {
+			report.ExitCode = 0
+			return &report, nil
+		}
+		if opts.Rm {
+			if deleteError := ic.Libpod.RemoveContainer(ctx, ctr, true, false); deleteError != nil {
+				logrus.Debugf("unable to remove container %s after failing to start and attach to it", ctr.ID())
+			}
+		}
+		if errors.Cause(err) == define.ErrWillDeadlock {
+			logrus.Debugf("Deadlock error on %q: %v", ctr.ID(), err)
+			report.ExitCode = define.ExitCode(err)
+			return &report, errors.Errorf("attempting to start container %s would cause a deadlock; please run 'podman system renumber' to resolve", ctr.ID())
+		}
+		report.ExitCode = define.ExitCode(err)
+		return &report, err
+	}
+
+	if ecode, err := ctr.Wait(); err != nil {
+		if errors.Cause(err) == define.ErrNoSuchCtr {
+			// Check events
+			event, err := ic.Libpod.GetLastContainerEvent(ctx, ctr.ID(), events.Exited)
+			if err != nil {
+				logrus.Errorf("Cannot get exit code: %v", err)
+				report.ExitCode = define.ExecErrorCodeNotFound
+			} else {
+				report.ExitCode = event.ContainerExitCode
+			}
+		}
+	} else {
+		report.ExitCode = int(ecode)
+	}
+	if opts.Rm {
+		if err := ic.Libpod.RemoveContainer(ctx, ctr, false, true); err != nil {
+			if errors.Cause(err) == define.ErrNoSuchCtr ||
+				errors.Cause(err) == define.ErrCtrRemoved {
+				logrus.Warnf("Container %s does not exist: %v", ctr.ID(), err)
+			} else {
+				logrus.Errorf("Error removing container %s: %v", ctr.ID(), err)
+			}
+		}
+	}
+	return &report, nil
 }
