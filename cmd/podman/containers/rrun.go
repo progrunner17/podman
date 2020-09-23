@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -12,8 +13,10 @@ import (
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/libpod/v2/cmd/podman/common"
 	"github.com/containers/libpod/v2/cmd/podman/registry"
+	"github.com/containers/libpod/v2/libpod"
 	"github.com/containers/libpod/v2/libpod/define"
 	"github.com/containers/libpod/v2/libpod/events"
+	"github.com/containers/libpod/v2/libpod/image"
 	"github.com/containers/libpod/v2/pkg/domain/entities"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi/terminal"
@@ -22,6 +25,7 @@ import (
 	"github.com/containers/libpod/v2/pkg/specgen"
 	"github.com/containers/libpod/v2/pkg/specgen/generate"
 	"github.com/containers/libpod/v2/pkg/util"
+	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -274,7 +278,7 @@ func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts en
 		fmt.Fprintf(os.Stderr, "%s\n", w)
 	}
 	// [TODO]: remote imageを使うように変更
-	ctr, err := generate.MakeContainer(ctx, ic.Libpod, opts.Spec)
+	ctr, err := makeContainer(ctx, ic.Libpod, opts.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -350,4 +354,315 @@ func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts en
 		}
 	}
 	return &report, nil
+}
+
+
+func createContainerOptions(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGenerator, pod *libpod.Pod, volumes []*specgen.NamedVolume, img *image.Image, command []string) ([]libpod.CtrCreateOption, error) {
+	var options []libpod.CtrCreateOption
+	var err error
+
+	if s.Stdin {
+		options = append(options, libpod.WithStdin())
+	}
+
+	useSystemd := false
+	switch s.Systemd {
+	case "always":
+		useSystemd = true
+	case "false":
+		break
+	case "", "true":
+		if len(command) == 0 {
+			command, err = img.Cmd(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if len(command) > 0 {
+			useSystemdCommands := map[string]bool{
+				"/sbin/init":           true,
+				"/usr/sbin/init":       true,
+				"/usr/local/sbin/init": true,
+			}
+			if useSystemdCommands[command[0]] || (filepath.Base(command[0]) == "systemd") {
+				useSystemd = true
+			}
+		}
+	default:
+		return nil, errors.Wrapf(err, "invalid value %q systemd option requires 'true, false, always'", s.Systemd)
+	}
+	logrus.Debugf("using systemd mode: %t", useSystemd)
+	if useSystemd {
+		// is StopSignal was not set by the user then set it to systemd
+		// expected StopSigal
+		if s.StopSignal == nil {
+			stopSignal, err := util.ParseSignal("RTMIN+3")
+			if err != nil {
+				return nil, errors.Wrapf(err, "error parsing systemd signal")
+			}
+			s.StopSignal = &stopSignal
+		}
+
+		options = append(options, libpod.WithSystemd())
+	}
+	if len(s.Name) > 0 {
+		logrus.Debugf("setting container name %s", s.Name)
+		options = append(options, libpod.WithName(s.Name))
+	}
+	if pod != nil {
+		logrus.Debugf("adding container to pod %s", pod.Name())
+		options = append(options, rt.WithPod(pod))
+	}
+	destinations := []string{}
+	// Take all mount and named volume destinations.
+	for _, mount := range s.Mounts {
+		destinations = append(destinations, mount.Destination)
+	}
+	for _, volume := range volumes {
+		destinations = append(destinations, volume.Dest)
+	}
+	options = append(options, libpod.WithUserVolumes(destinations))
+
+	if len(volumes) != 0 {
+		var vols []*libpod.ContainerNamedVolume
+		for _, v := range volumes {
+			vols = append(vols, &libpod.ContainerNamedVolume{
+				Name:    v.Name,
+				Dest:    v.Dest,
+				Options: v.Options,
+			})
+		}
+		options = append(options, libpod.WithNamedVolumes(vols))
+	}
+
+	if s.Command != nil {
+		options = append(options, libpod.WithCommand(s.Command))
+	}
+	if s.Entrypoint != nil {
+		options = append(options, libpod.WithEntrypoint(s.Entrypoint))
+	}
+	// If the user did not set an workdir but the image did, ensure it is
+	// created.
+	if s.WorkDir == "" && img != nil {
+		options = append(options, libpod.WithCreateWorkingDir())
+	}
+	if s.StopSignal != nil {
+		options = append(options, libpod.WithStopSignal(*s.StopSignal))
+	}
+	if s.StopTimeout != nil {
+		options = append(options, libpod.WithStopTimeout(*s.StopTimeout))
+	}
+	if s.LogConfiguration != nil {
+		if len(s.LogConfiguration.Path) > 0 {
+			options = append(options, libpod.WithLogPath(s.LogConfiguration.Path))
+		}
+		if len(s.LogConfiguration.Options) > 0 && s.LogConfiguration.Options["tag"] != "" {
+			// Note: I'm really guessing here.
+			options = append(options, libpod.WithLogTag(s.LogConfiguration.Options["tag"]))
+		}
+
+		if len(s.LogConfiguration.Driver) > 0 {
+			options = append(options, libpod.WithLogDriver(s.LogConfiguration.Driver))
+		}
+	}
+
+	// Security options
+	if len(s.SelinuxOpts) > 0 {
+		options = append(options, libpod.WithSecLabels(s.SelinuxOpts))
+	}
+	options = append(options, libpod.WithPrivileged(s.Privileged))
+
+	// 	// Get namespace related options
+	// 	namespaceOptions, err := namespaceOptions(ctx, s, rt, pod, img)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	options = append(options, namespaceOptions...)
+
+	if len(s.ConmonPidFile) > 0 {
+		options = append(options, libpod.WithConmonPidFile(s.ConmonPidFile))
+	}
+	options = append(options, libpod.WithLabels(s.Labels))
+	if s.ShmSize != nil {
+		options = append(options, libpod.WithShmSize(*s.ShmSize))
+	}
+	if s.Rootfs != "" {
+		options = append(options, libpod.WithRootFS(s.Rootfs))
+	}
+	// Default used if not overridden on command line
+
+	if s.RestartPolicy != "" {
+		if s.RestartRetries != nil {
+			options = append(options, libpod.WithRestartRetries(*s.RestartRetries))
+		}
+		options = append(options, libpod.WithRestartPolicy(s.RestartPolicy))
+	}
+
+	if s.ContainerHealthCheckConfig.HealthConfig != nil {
+		options = append(options, libpod.WithHealthCheck(s.ContainerHealthCheckConfig.HealthConfig))
+		logrus.Debugf("New container has a health check")
+	}
+	return options, nil
+}
+
+func makeCommand(ctx context.Context, s *specgen.SpecGenerator, img *image.Image, rtc *config.Config) ([]string, error) {
+	finalCommand := []string{}
+
+	entrypoint := s.Entrypoint
+	if entrypoint == nil && img != nil {
+		newEntry, err := img.Entrypoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entrypoint = newEntry
+	}
+
+	finalCommand = append(finalCommand, entrypoint...)
+
+	// Only use image command if the user did not manually set an
+	// entrypoint.
+	command := s.Command
+	if command == nil && img != nil && s.Entrypoint == nil {
+		newCmd, err := img.Cmd(ctx)
+		if err != nil {
+			return nil, err
+		}
+		command = newCmd
+	}
+
+	finalCommand = append(finalCommand, command...)
+
+	if len(finalCommand) == 0 {
+		return nil, errors.Errorf("no command or entrypoint provided, and no CMD or ENTRYPOINT from image")
+	}
+
+	if s.Init {
+		initPath := s.InitPath
+		if initPath == "" && rtc != nil {
+			initPath = rtc.Engine.InitPath
+		}
+		if initPath == "" {
+			return nil, errors.Errorf("no path to init binary found but container requested an init")
+		}
+		finalCommand = append([]string{"/dev/init", "--"}, finalCommand...)
+	}
+
+	return finalCommand, nil
+}
+
+func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGenerator) (*libpod.Container, error) {
+	rtc, err := rt.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// If joining a pod, retrieve the pod for use.
+	var pod *libpod.Pod
+	if s.Pod != "" {
+		pod, err = rt.LookupPod(s.Pod)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error retrieving pod %s", s.Pod)
+		}
+	}
+
+	// Set defaults for unset namespaces
+	if s.PidNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("pid", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.PidNS = defaultNS
+	}
+	if s.IpcNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("ipc", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.IpcNS = defaultNS
+	}
+	if s.UtsNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("uts", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.UtsNS = defaultNS
+	}
+	if s.UserNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("user", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.UserNS = defaultNS
+	}
+	if s.NetNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("net", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.NetNS = defaultNS
+	}
+	if s.CgroupNS.IsDefault() {
+		defaultNS, err := generate.GetDefaultNamespaceMode("cgroup", rtc, pod)
+		if err != nil {
+			return nil, err
+		}
+		s.CgroupNS = defaultNS
+	}
+
+	options := []libpod.CtrCreateOption{}
+	if s.ContainerCreateCommand != nil {
+		options = append(options, libpod.WithCreateCommand(s.ContainerCreateCommand))
+	}
+
+	var newImage *image.Image
+	if s.Rootfs != "" {
+		options = append(options, libpod.WithRootFS(s.Rootfs))
+	} else {
+		newImage, err = rt.ImageRuntime().NewFromLocal(s.Image)
+		if err != nil {
+			return nil, err
+		}
+		imgName := s.Image
+		names := newImage.Names()
+		if len(names) > 0 {
+			imgName = names[0]
+		}
+		options = append(options, libpod.WithRootFSFromImage(newImage.ID(), imgName, s.Image))
+	}
+	if err := s.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid config provided")
+	}
+
+	// 	finalMounts, finalVolumes, err := finalizeMounts(ctx, s, rt, rtc, newImage)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	finalMounts := make([]spec.Mount, 0, 0)
+	finalVolumes := make([]*specgen.NamedVolume, 0, 0)
+
+	// [TODO]:
+	command, err := makeCommand(ctx, s, newImage, rtc)
+	if err != nil {
+		return nil, err
+	}
+
+	// [TODO]:
+	opts, err := createContainerOptions(ctx, rt, s, pod, finalVolumes, newImage, command)
+	if err != nil {
+		return nil, err
+	}
+	options = append(options, opts...)
+
+	exitCommandArgs, err := generate.CreateExitCommandArgs(rt.StorageConfig(), rtc, logrus.IsLevelEnabled(logrus.DebugLevel), s.Remove, false)
+	if err != nil {
+		return nil, err
+	}
+	options = append(options, libpod.WithExitCommand(exitCommandArgs))
+
+	runtimeSpec, err := generate.SpecGenToOCI(ctx, s, rt, rtc, newImage, finalMounts, pod, command)
+	if err != nil {
+		return nil, err
+	}
+	return rt.NewContainer(ctx, runtimeSpec, options...)
 }
