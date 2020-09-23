@@ -268,7 +268,26 @@ func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts en
 		return nil, fmt.Errorf("ContainerEngine needs abi.ContainerEngine")
 	}
 
-	// [TODO]: remote imageを使うように変更
+	// 	opts.Spec.Image = ""
+	// 			s.HealthConfig, err = newImage.GetHealthCheck(ctx)
+	// 			stopSignal, err := newImage.StopSignal(ctx)
+	// 			sig, err := signal.ParseSignalNameOrNumber(stopSignal)
+	// 			s.StopSignal = &sig
+	// 		imageEnvs, err := newImage.Env(ctx)
+	// 		envs, err = envLib.ParseSlice(imageEnvs)
+	// 	s.Env = envLib.Join(envLib.Join(defaultEnvs, envs), s.Env)
+	// 		labels, err := newImage.Labels(ctx)
+	// 				s.Labels[k] = v
+	// 		imgAnnotations, err := newImage.Annotations(ctx)
+	// 			annotations[k] = v
+	// 	s.Annotations = annotations
+	// 			workingDir, err := newImage.WorkingDir(ctx)
+	// 			s.WorkDir = workingDir
+	// 		s.User, err = newImage.User(ctx)
+	// [TODO]: remote imageを使えるように変更
+	// annotationsはあとからセットする方がよさそう？
+	// それ以外は、generate.CompleteSpec で十分なはず
+	// @pkg/specgen/generate/container.go
 	warn, err := generate.CompleteSpec(ctx, ic.Libpod, opts.Spec)
 	if err != nil {
 		return nil, err
@@ -297,6 +316,7 @@ func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts en
 	}
 	if opts.Detach {
 		// if the container was created as part of a pod, also start its dependencies, if any.
+		// [TODO]: StartAttachCtrと同様に修正
 		if err := ctr.Start(ctx, joinPod); err != nil {
 			// This means the command did not exist
 			report.ExitCode = define.ExitCode(err)
