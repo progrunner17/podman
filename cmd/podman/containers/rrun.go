@@ -9,14 +9,16 @@ import (
 	"strings"
 
 	"github.com/containers/common/pkg/config"
+	"github.com/containers/image/v5/image"
 	"github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/transports/alltransports"
+	"github.com/containers/image/v5/types"
 	"github.com/containers/libpod/v2/cmd/podman/common"
 	"github.com/containers/libpod/v2/cmd/podman/registry"
 	"github.com/containers/libpod/v2/libpod"
 	"github.com/containers/libpod/v2/libpod/define"
 	"github.com/containers/libpod/v2/libpod/events"
-	"github.com/containers/libpod/v2/libpod/image"
+	limage "github.com/containers/libpod/v2/libpod/image"
 	"github.com/containers/libpod/v2/pkg/domain/entities"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi/terminal"
@@ -141,7 +143,8 @@ func rrun(cmd *cobra.Command, args []string) error {
 
 	imageName := args[0]
 	if !cliVals.RootFS {
-		name, err := pullRImage(args[0])
+		pullRImage(args[0]) // [TODO]: pullRImageを使う
+		name, err := pullImage(args[0])
 		if err != nil {
 			return err
 		}
@@ -247,18 +250,41 @@ func pullRImage(imageName string) (string, error) {
 		if pullPolicy == config.PullImageNever {
 			return "", errors.Wrapf(define.ErrNoSuchImage, "unable to find a name and tag match for %s in repotags", imageName)
 		}
-		pullReport, pullErr := registry.ImageEngine().Pull(registry.GetContext(), imageName, entities.ImagePullOptions{
-			Authfile:     cliVals.Authfile,
-			Quiet:        cliVals.Quiet,
-			OverrideArch: cliVals.OverrideArch,
-			OverrideOS:   cliVals.OverrideOS,
-		})
-		if pullErr != nil {
-			return "", pullErr
+		is, err := parseImageSource(registry.GetContext(), "docker://"+imageName)
+		if err != nil {
+			logrus.Panicf("[DEBUG] parseImageSource failed %v", err)
+			return "", err
 		}
-		imageName = pullReport.Images[0]
+		img, err := image.FromUnparsedImage(registry.GetContext(), nil, image.UnparsedInstance(is, nil))
+		if err != nil {
+			logrus.Panicf("Error parsing manifest for image: %v", err)
+		}
+
+		info, err := img.Inspect(registry.GetContext())
+		if err != nil {
+			logrus.Panicf("Inspect image: %v", err)
+		}
+		logrus.WithField("info", info).Info("[DEBUG]")
+		// 		pullReport, pullErr := registry.ImageEngine().Pull(registry.GetContext(), imageName, entities.ImagePullOptions{
+		// 			Authfile:     cliVals.Authfile,
+		// 			Quiet:        cliVals.Quiet,
+		// 			OverrideArch: cliVals.OverrideArch,
+		// 			OverrideOS:   cliVals.OverrideOS,
+		// 		})
+		// 		if pullErr != nil {
+		// 			return "", pullErr
+		// 		}
+		// 		imageName = pullReport.Images[0]
 	}
 	return imageName, nil
+}
+
+func parseImageSource(ctx context.Context, name string) (types.ImageSource, error) {
+	ref, err := alltransports.ParseImageName(name)
+	if err != nil {
+		return nil, err
+	}
+	return ref.NewImageSource(ctx, &types.SystemContext{})
 }
 
 // [TODO]: manifestやconfigをこの関数に渡したい
@@ -376,8 +402,7 @@ func containerRRun(ctx context.Context, raw_ic entities.ContainerEngine, opts en
 	return &report, nil
 }
 
-
-func createContainerOptions(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGenerator, pod *libpod.Pod, volumes []*specgen.NamedVolume, img *image.Image, command []string) ([]libpod.CtrCreateOption, error) {
+func createContainerOptions(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGenerator, pod *libpod.Pod, volumes []*specgen.NamedVolume, img *limage.Image, command []string) ([]libpod.CtrCreateOption, error) {
 	var options []libpod.CtrCreateOption
 	var err error
 
@@ -526,7 +551,7 @@ func createContainerOptions(ctx context.Context, rt *libpod.Runtime, s *specgen.
 	return options, nil
 }
 
-func makeCommand(ctx context.Context, s *specgen.SpecGenerator, img *image.Image, rtc *config.Config) ([]string, error) {
+func makeCommand(ctx context.Context, s *specgen.SpecGenerator, img *limage.Image, rtc *config.Config) ([]string, error) {
 	finalCommand := []string{}
 
 	entrypoint := s.Entrypoint
@@ -635,7 +660,7 @@ func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGener
 		options = append(options, libpod.WithCreateCommand(s.ContainerCreateCommand))
 	}
 
-	var newImage *image.Image
+	var newImage *limage.Image
 	if s.Rootfs != "" {
 		options = append(options, libpod.WithRootFS(s.Rootfs))
 	} else {
