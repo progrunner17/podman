@@ -664,5 +664,5 @@ func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGener
 	if err != nil {
 		return nil, err
 	}
-	return rt.NewContainer(ctx, runtimeSpec, options...)
+	return rt.NewRContainer(ctx, runtimeSpec, options...)
 }
