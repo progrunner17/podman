@@ -3,14 +3,16 @@ package containers
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/image"
-	"github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/libpod/v2/cmd/podman/common"
@@ -22,16 +24,19 @@ import (
 	"github.com/containers/libpod/v2/pkg/domain/entities"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi"
 	"github.com/containers/libpod/v2/pkg/domain/infra/abi/terminal"
+	envLib "github.com/containers/libpod/v2/pkg/env"
 	"github.com/containers/libpod/v2/pkg/errorhandling"
 	"github.com/containers/libpod/v2/pkg/rootless"
 	"github.com/containers/libpod/v2/pkg/specgen"
 	"github.com/containers/libpod/v2/pkg/specgen/generate"
 	"github.com/containers/libpod/v2/pkg/util"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -142,9 +147,11 @@ func rrun(cmd *cobra.Command, args []string) error {
 	}
 
 	imageName := args[0]
+	var ociCfg *v1.Image
+	var name string
 	if !cliVals.RootFS {
-		pullRImage(args[0]) // [TODO]: pullRImageを使う
-		name, err := pullImage(args[0])
+		name, ociCfg, err = pullRImage(args[0])
+		// 		name, err := pullImage(args[0])
 		if err != nil {
 			return err
 		}
@@ -186,7 +193,20 @@ func rrun(cmd *cobra.Command, args []string) error {
 	rrunOpts.Detach = cliVals.Detach
 	rrunOpts.DetachKeys = cliVals.DetachKeys
 	// [TODO]: remote imageを使ってNewSpecGeneratorを動かせるようにする
-	s := specgen.NewSpecGenerator(imageName, cliVals.RootFS)
+	s := specgen.NewSpecGenerator("", cliVals.RootFS)
+	ctrMntDir, ctrRootDir, err := createRootFSMountPoint(imageName)
+	if err != nil {
+		return err
+	}
+	defer finalizeMountPoint(ctrMntDir, ctrRootDir)
+	s.Rootfs = ctrMntDir
+	// 	s.Rootfs = "/home/vagrant/hello-world/hello-root"
+	logrus.WithField("rootfs", s.Rootfs).Info("[DEBUG]")
+	s.Command = ociCfg.Config.Cmd
+	s.Entrypoint = ociCfg.Config.Entrypoint
+	envs, err := envLib.ParseSlice(ociCfg.Config.Env)
+	s.Env = envLib.Join(s.Env, envs)
+	s.WorkDir = ociCfg.Config.WorkingDir
 	if err := common.FillOutSpecGen(s, &cliVals, args); err != nil {
 		return err
 	}
@@ -224,47 +244,73 @@ func rrun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func pullRImage(imageName string) (string, error) {
+func pullRImage(imageName string) (string, *v1.Image, error) {
+	var ociCfg *v1.Image
 	pullPolicy, err := config.ValidatePullPolicy(cliVals.Pull)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Check if the image is missing and hence if we need to pull it.
 	imageMissing := true
 	imageRef, err := alltransports.ParseImageName(imageName)
-	switch {
-	case err != nil:
-		// Assume we specified a local image withouth the explicit storage transport.
-		fallthrough
-
-	case imageRef.Transport().Name() == storage.Transport.Name():
-		br, err := registry.ImageEngine().Exists(registry.GetContext(), imageName)
-		if err != nil {
-			return "", err
-		}
-		imageMissing = !br.Value
-	}
+	logrus.WithField("imageRef", imageRef).Info("[DEBUG]")
+	// 	switch {
+	// 	case err != nil:
+	// 		// Assume we specified a local image withouth the explicit storage transport.
+	// 		fallthrough
+	//
+	// 	case imageRef.Transport().Name() == storage.Transport.Name():
+	// 		br, err := registry.ImageEngine().Exists(registry.GetContext(), imageName)
+	// 		if err != nil {
+	// 			return "", err
+	// 		}
+	// 		imageMissing = !br.Value
+	// 	}
 
 	if imageMissing || pullPolicy == config.PullImageAlways {
 		if pullPolicy == config.PullImageNever {
-			return "", errors.Wrapf(define.ErrNoSuchImage, "unable to find a name and tag match for %s in repotags", imageName)
+			return "", nil, errors.Wrapf(define.ErrNoSuchImage, "unable to find a name and tag match for %s in repotags", imageName)
 		}
 		is, err := parseImageSource(registry.GetContext(), "docker://"+imageName)
 		if err != nil {
 			logrus.Panicf("[DEBUG] parseImageSource failed %v", err)
-			return "", err
+			return "", nil, err
 		}
+		// 		logrus.WithField("imageSource", is).Info("[DEBUG]")
+		logrus.WithField("imageSource", is.Reference().DockerReference()).Info("[DEBUG]")
+
 		img, err := image.FromUnparsedImage(registry.GetContext(), nil, image.UnparsedInstance(is, nil))
 		if err != nil {
 			logrus.Panicf("Error parsing manifest for image: %v", err)
 		}
+		// 		logrus.WithField("image", img).Info("[DEBUG]")
 
 		info, err := img.Inspect(registry.GetContext())
 		if err != nil {
 			logrus.Panicf("Inspect image: %v", err)
 		}
 		logrus.WithField("info", info).Info("[DEBUG]")
+		if err != nil {
+			logrus.Panicf("LayerInfosForCopy: %v", err)
+		}
+		ociCfg, err = img.OCIConfig(registry.GetContext())
+		if err != nil {
+			logrus.Panicf("get OCIConfig image: %v", err)
+		}
+		// 		logrus.WithField("cmd", ociCfg.Config.Cmd).Info("[DEBUG]")
+		// 		logrus.WithField("entrypoint", ociCfg.Config.Entrypoint).Info("[DEBUG]")
+		// 		logrus.WithField("env", ociCfg.Config.Env).Info("[DEBUG]")
+		// 		logrus.WithField("workdir", ociCfg.Config.WorkingDir).Info("[DEBUG]")
+		// 		logrus.WithField("ports", ociCfg.Config.ExposedPorts).Info("[DEBUG]")
+		// 		logrus.WithField("labels", ociCfg.Config.Labels).Info("[DEBUG]")
+		// 		logrus.WithField("signals", ociCfg.Config.StopSignal).Info("[DEBUG]")
+		// 		logrus.WithField("user", ociCfg.Config.User).Info("[DEBUG]")
+		// 		logrus.WithField("volumes", ociCfg.Config.Volumes).Info("[DEBUG]")
+		// 		logrus.WithField("rootfs type", ociCfg.RootFS.Type).Info("[DEBUG]")
+		// 		for i, digest := range ociCfg.RootFS.DiffIDs {
+		// 			logrus.WithField("i", i).WithField("hex", digest.Hex()).WithField("string", digest.String()).WithField("algorithm", digest.Algorithm().String()).Info("[DEBUG]")
+		// 		}
 		// 		pullReport, pullErr := registry.ImageEngine().Pull(registry.GetContext(), imageName, entities.ImagePullOptions{
 		// 			Authfile:     cliVals.Authfile,
 		// 			Quiet:        cliVals.Quiet,
@@ -276,7 +322,7 @@ func pullRImage(imageName string) (string, error) {
 		// 		}
 		// 		imageName = pullReport.Images[0]
 	}
-	return imageName, nil
+	return imageName, ociCfg, nil
 }
 
 func parseImageSource(ctx context.Context, name string) (types.ImageSource, error) {
@@ -664,16 +710,17 @@ func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGener
 	if s.Rootfs != "" {
 		options = append(options, libpod.WithRootFS(s.Rootfs))
 	} else {
-		newImage, err = rt.ImageRuntime().NewFromLocal(s.Image)
-		if err != nil {
-			return nil, err
-		}
-		imgName := s.Image
-		names := newImage.Names()
-		if len(names) > 0 {
-			imgName = names[0]
-		}
-		options = append(options, libpod.WithRootFSFromImage(newImage.ID(), imgName, s.Image))
+		// 		newImage, err = rt.ImageRuntime().NewFromLocal(s.Image)
+		// 		if err != nil {
+		// 			return nil, err
+		// 		}
+		// 		imgName := s.Image
+		// 		names := newImage.Names()
+		// 		if len(names) > 0 {
+		// 			imgName = names[0]
+		// 		}
+		// 		options = append(options, libpod.WithRootFSFromImage(newImage.ID(), imgName, s.Image))
+		logrus.Fatal("specify Rootfs!!!")
 	}
 	if err := s.Validate(); err != nil {
 		return nil, errors.Wrap(err, "invalid config provided")
@@ -710,4 +757,59 @@ func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGener
 		return nil, err
 	}
 	return rt.NewRContainer(ctx, runtimeSpec, options...)
+}
+
+// 呼び出した後に、deferでfinalizeMountPointする
+func createRootFSMountPoint(image string) (mntDir string, rootDir string, err error) {
+	parentDir := os.TempDir() // /tmp
+	rootDir, err = ioutil.TempDir(parentDir, "llpfs-*-root")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create dir for mntpoint: %v", err)
+	}
+	mntDir = rootDir + "/mnt"
+	workDir := rootDir + "/work"
+	upperDir := rootDir + "/upper"
+	if err = os.Mkdir(mntDir, 0755); err != nil {
+		return "", rootDir, fmt.Errorf("failed to create dir for mntpoint: %v", err)
+	}
+	if err = os.Mkdir(workDir, 0755); err != nil {
+		return "", rootDir, fmt.Errorf("failed to create dir for work dir: %v", err)
+	}
+	if err = os.Mkdir(upperDir, 0755); err != nil {
+		return "", rootDir, fmt.Errorf("failed to create dir for upper dir: %v", err)
+	}
+
+	//llpfs -d --debug -o remote_image=alpine,workdir=./work,upperdir=./upper,src_type=remote ./mnt
+	cmd := osexec.Command("llpfs")
+	// 各種設定
+	cmd.Args = append(cmd.Args, "-d")
+	cmd.Args = append(cmd.Args, "--debug")
+
+	opts := "-o"
+	opts += fmt.Sprintf("remote_image=%s,", image)
+	opts += fmt.Sprintf("workdir=%s,", workDir)
+	opts += fmt.Sprintf("upperdir=%s,", upperDir)
+	opts += "src_type=remote"
+	cmd.Args = append(cmd.Args, opts)
+	cmd.Args = append(cmd.Args, mntDir)
+	err = cmd.Start()
+	if err != nil {
+		return "", rootDir, fmt.Errorf("failed to execute llpfs: %v", err)
+	}
+	time.Sleep(time.Millisecond * 5000)
+	return mntDir, rootDir, nil
+}
+
+func finalizeMountPoint(mntPoint, rootDir string) error {
+	err := unix.Unmount(mntPoint, 0)
+	if err != nil {
+		logrus.Errorf("failed to unmount %s: %v", mntPoint, err)
+		return err
+	}
+	err = os.RemoveAll(rootDir)
+	if err != nil {
+		logrus.Errorf("failed to remove %s: %v", mntPoint, err)
+		return err
+	}
+	return nil
 }
