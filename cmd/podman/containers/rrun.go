@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/image"
@@ -36,7 +35,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -769,6 +767,7 @@ func createRootFSMountPoint(image string) (mntDir string, rootDir string, err er
 	mntDir = rootDir + "/mnt"
 	workDir := rootDir + "/work"
 	upperDir := rootDir + "/upper"
+	lockFile := rootDir + "/lock"
 	if err = os.Mkdir(mntDir, 0755); err != nil {
 		return "", rootDir, fmt.Errorf("failed to create dir for mntpoint: %v", err)
 	}
@@ -785,31 +784,53 @@ func createRootFSMountPoint(image string) (mntDir string, rootDir string, err er
 	cmd.Args = append(cmd.Args, "-d")
 	cmd.Args = append(cmd.Args, "--debug")
 
+	registry := "docker.io"
+	slice := strings.Split(image, "/")
+	if len(slice) > 2 {
+		logrus.Panic()
+	} else if len(slice) == 2 {
+		registry = slice[0]
+		image = slice[1]
+	}
 	opts := "-o"
+	opts += fmt.Sprintf("remote_registry=%s,", registry)
 	opts += fmt.Sprintf("remote_image=%s,", image)
 	opts += fmt.Sprintf("workdir=%s,", workDir)
 	opts += fmt.Sprintf("upperdir=%s,", upperDir)
+	opts += fmt.Sprintf("lockfile=%s,", lockFile)
 	opts += "src_type=remote"
 	cmd.Args = append(cmd.Args, opts)
 	cmd.Args = append(cmd.Args, mntDir)
+	logrus.WithField("opts", cmd.Args).Infof("[DEBUG]")
 	err = cmd.Start()
 	if err != nil {
 		return "", rootDir, fmt.Errorf("failed to execute llpfs: %v", err)
 	}
-	time.Sleep(time.Millisecond * 5000)
+
+	for {
+		lockFp, err := os.Open(lockFile)
+		if err == nil {
+			lockFp.Close()
+			break
+		}
+	}
+	// 	time.Sleep(time.Millisecond * 5000)
 	return mntDir, rootDir, nil
 }
 
 func finalizeMountPoint(mntPoint, rootDir string) error {
-	err := unix.Unmount(mntPoint, 0)
+	cmd := osexec.Command("fusermount3")
+	cmd.Args = append(cmd.Args, "-u")
+	cmd.Args = append(cmd.Args, mntPoint)
+	err := cmd.Run()
 	if err != nil {
 		logrus.Errorf("failed to unmount %s: %v", mntPoint, err)
 		return err
 	}
-	err = os.RemoveAll(rootDir)
-	if err != nil {
-		logrus.Errorf("failed to remove %s: %v", mntPoint, err)
-		return err
-	}
+	// 	err = os.RemoveAll(rootDir)
+	// 	if err != nil {
+	// 		logrus.Errorf("failed to remove %s: %v", mntPoint, err)
+	// 		return err
+	// 	}
 	return nil
 }
