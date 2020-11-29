@@ -1,14 +1,22 @@
 package containers
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httputil"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/image"
@@ -29,12 +37,14 @@ import (
 	"github.com/containers/libpod/v2/pkg/specgen"
 	"github.com/containers/libpod/v2/pkg/specgen/generate"
 	"github.com/containers/libpod/v2/pkg/util"
+	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/xerrors"
 )
 
 var (
@@ -146,14 +156,32 @@ func rrun(cmd *cobra.Command, args []string) error {
 
 	imageName := args[0]
 	var ociCfg *v1.Image
-	var name string
+	var ctrMntDir string
+	logrus.Info("[DEBUG] prepareRemoteImage!!!")
 	if !cliVals.RootFS {
-		name, ociCfg, err = pullRImage(args[0])
+		ctx := registry.GetContext()
+		img, err := getImage(ctx, "docker://"+args[0])
+		if err != nil {
+			logrus.Fatalf("parse image source: %+v", err)
+		}
+		ctrMntDirTmp, finalize, err := prepareRemoteImage(ctx, img, 2)
+		logrus.Info("[DEBUG] prepareRemoteImage")
+		if err != nil {
+			logrus.Errorf("%+v", err)
+		}
+		ctrMntDir = ctrMntDirTmp
+		defer finalize()
+		ociCfg, err = img.OCIConfig(registry.GetContext())
+
+		// NOTE: llpfs1
+		// 		name, ociCfg, err = pullRImage(args[0])
+		//TODO: 2
 		// 		name, err := pullImage(args[0])
 		if err != nil {
 			return err
 		}
-		imageName = name
+		// 		imageName = name
+		imageName = ""
 	}
 
 	if cliVals.Replace {
@@ -192,11 +220,13 @@ func rrun(cmd *cobra.Command, args []string) error {
 	rrunOpts.DetachKeys = cliVals.DetachKeys
 	// [TODO]: remote imageを使ってNewSpecGeneratorを動かせるようにする
 	s := specgen.NewSpecGenerator("", cliVals.RootFS)
-	ctrMntDir, ctrRootDir, err := createRootFSMountPoint(imageName)
-	if err != nil {
-		return err
-	}
-	defer finalizeMountPoint(ctrMntDir, ctrRootDir)
+	// NOTE: llpfs1
+	// 	ctrMntDir, ctrRootDir, err := createRootFSMountPoint(imageName)
+	// 	if err != nil {
+	// 		return err
+	// 	}
+	// 	defer finalizeMountPoint(ctrMntDir, ctrRootDir)
+
 	s.Rootfs = ctrMntDir
 	// 	s.Rootfs = "/home/vagrant/hello-world/hello-root"
 	logrus.WithField("rootfs", s.Rootfs).Info("[DEBUG]")
@@ -252,7 +282,7 @@ func pullRImage(imageName string) (string, *v1.Image, error) {
 	// Check if the image is missing and hence if we need to pull it.
 	imageMissing := true
 	imageRef, err := alltransports.ParseImageName(imageName)
-	logrus.WithField("imageRef", imageRef).Info("[DEBUG]")
+	logrus.WithField("imageRef", imageRef).Info("[DEBUG]") // => nil
 	// 	switch {
 	// 	case err != nil:
 	// 		// Assume we specified a local image withouth the explicit storage transport.
@@ -283,6 +313,16 @@ func pullRImage(imageName string) (string, *v1.Image, error) {
 			logrus.Panicf("Error parsing manifest for image: %v", err)
 		}
 		// 		logrus.WithField("image", img).Info("[DEBUG]")
+		for i, l := range img.LayerInfos() {
+			logrus.WithFields(logrus.Fields{
+				"idx":     i,
+				"digest":  l.Digest.Encoded(),
+				"digest2": l.Digest.Hex(),
+				"digest3": l.Digest.String(),
+				"type":    l.MediaType,
+				"size":    l.Size,
+			}).Info("[DEBUG]")
+		}
 
 		info, err := img.Inspect(registry.GetContext())
 		if err != nil {
@@ -750,6 +790,7 @@ func makeContainer(ctx context.Context, rt *libpod.Runtime, s *specgen.SpecGener
 	}
 	options = append(options, libpod.WithExitCommand(exitCommandArgs))
 
+	// newImageはsecurityConfigureGeneratorへの引数としてのみ使われる
 	runtimeSpec, err := generate.SpecGenToOCI(ctx, s, rt, rtc, newImage, finalMounts, pod, command)
 	if err != nil {
 		return nil, err
@@ -780,6 +821,7 @@ func createRootFSMountPoint(image string) (mntDir string, rootDir string, err er
 
 	//llpfs -d --debug -o remote_image=alpine,workdir=./work,upperdir=./upper,src_type=remote ./mnt
 	cmd := osexec.Command("llpfs")
+	// 	cmd.Stderr = os.Stderr
 	// 各種設定
 	cmd.Args = append(cmd.Args, "-d")
 	cmd.Args = append(cmd.Args, "--debug")
@@ -833,4 +875,342 @@ func finalizeMountPoint(mntPoint, rootDir string) error {
 	// 		return err
 	// 	}
 	return nil
+}
+
+type layerInfo struct {
+	key      string
+	path     string
+	pullFunc func() error
+}
+type pullInfo struct {
+	layerInfo *layerInfo
+	Conn      net.Conn
+}
+
+func prepareRemoteImage(ctx context.Context, img types.Image, numPullThreads int) (string, func(), error) {
+	wg := new(sync.WaitGroup)
+	pichan := make(chan *pullInfo)
+	liMap := make(map[string]*layerInfo)
+	tmpDir := os.TempDir()
+	layersRootDir, err := ioutil.TempDir(tmpDir, "llpfs2-*-root")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create dir for mntpoint: %v", err)
+	}
+	sockPath := filepath.Join(layersRootDir, "llpfs2.socket")
+	mntDir := filepath.Join(layersRootDir, "mnt")
+	workDir := filepath.Join(layersRootDir, "work")
+	upperDir := filepath.Join(layersRootDir, "upper")
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	if err = os.Mkdir(mntDir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create dir for mntpoint: %v", err)
+	}
+	if err = os.Mkdir(workDir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create dir for work dir: %v", err)
+	}
+	if err = os.Mkdir(upperDir, 0755); err != nil {
+		return "", nil, fmt.Errorf("failed to create dir for upper dir: %v", err)
+	}
+
+	for i := 0; i < numPullThreads; i++ {
+		wg.Add(1)
+		go pullThread(ctx, i, pichan, wg)
+	}
+
+	refStr := img.Reference().DockerReference().String()
+	tagPos := strings.LastIndex(refStr, ":")
+	repoPos := strings.Index(refStr, "/")
+	repoName := refStr[0:repoPos]
+	imageName := refStr[repoPos+1 : tagPos]
+
+	var lowerLayers, tmpLayers []string
+	for _, l := range img.LayerInfos() {
+		li := new(layerInfo)
+		digest := &l.Digest
+		url := fmt.Sprintf("http://%s/v2/%s/blobs/%s", repoName, imageName, digest.String()) // 最後の/を忘れずに
+		li.key = digest.Hex()
+		li.path = filepath.Join(layersRootDir, li.key, "diff")
+		if err = os.MkdirAll(li.path, 0755); err != nil {
+			return "", nil, fmt.Errorf("failed to create dir for layer dir: %v", err)
+		}
+
+		li.pullFunc = generateLayerPullFunc(url, li.path, digest)
+		liMap[li.key] = li
+		logrus.WithFields(logrus.Fields{
+			"key":  li.key,
+			"len":  len(li.key),
+			"path": li.path,
+		}).Info("append layer")
+		tmpLayers = append(tmpLayers, fmt.Sprintf("//unix_wait+%s+%s", li.key, li.path))
+	}
+
+	for i := len(tmpLayers) - 1; i >= 0; i-- {
+		lowerLayers = append(lowerLayers, tmpLayers[i])
+	}
+
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		logrus.Fatalf("listen path %s: %v", sockPath, err)
+	}
+
+	cmd := osexec.Command("llpfs2")
+	cmd.Stderr = os.Stderr
+	// 	cmd.Args = append(cmd.Args, "-d")
+	// 	cmd.Args = append(cmd.Args, "--debug")
+
+	opts := "-o"
+	opts += fmt.Sprintf("workdir=%s,", workDir)
+	opts += fmt.Sprintf("upperdir=%s,", upperDir)
+	opts += fmt.Sprintf("lowerdir=%s,", strings.Join(lowerLayers, "$"))
+	opts += fmt.Sprintf("socket_path=%s,", sockPath)
+	opts += "log_level=trace,"
+	opts += "fast_ino=1,"
+	opts += "log_file=./llpfs2_log,"
+	opts += "delims=\"$\","
+	opts += "use_upmost"
+	cmd.Args = append(cmd.Args, opts)
+	cmd.Args = append(cmd.Args, mntDir)
+	err = cmd.Run()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to execute llpfs: %v", err)
+	}
+
+	for i := 0; i < len(liMap); i++ {
+		conn, err := listener.Accept()
+		logrus.Info("Accept socket")
+		if err != nil {
+			return "", nil, xerrors.Errorf("accept error: %w", err)
+		}
+		wg.Add(1)
+		go waitRequest(ctx, conn, pichan, wg, liMap)
+	}
+
+	finalize := func() {
+		logrus.Info("start finalize")
+		cancel()
+		logrus.Info("canceled")
+		wg.Wait()
+		logrus.Info("wg.Wait")
+		cmd := osexec.Command("fusermount3")
+		cmd.Args = append(cmd.Args, "-u")
+		cmd.Args = append(cmd.Args, mntDir)
+		err := cmd.Run()
+		if err != nil {
+			logrus.Errorf("failed to unmount %s: %v", mntDir, err)
+		}
+		err = os.RemoveAll(layersRootDir)
+		if err != nil {
+			logrus.Errorf("failed to remove %s: %v", layersRootDir, err)
+			return
+		}
+	}
+
+	return mntDir, finalize, nil
+}
+
+func getImage(ctx context.Context, name string) (types.Image, error) {
+	ref, err := alltransports.ParseImageName(name)
+	if err != nil {
+		return nil, err
+	}
+	imgSrc, err := ref.NewImageSource(ctx, &types.SystemContext{})
+	if err != nil {
+		return nil, err
+	}
+
+	imgRef := imgSrc.Reference().DockerReference()
+	logrus.WithField("ref", imgRef).Info("[DEBUG]")
+
+	refStr := imgRef.String()
+	tagPos := strings.LastIndex(refStr, ":")
+	repoPos := strings.Index(refStr, "/")
+
+	repo := refStr[0:repoPos]
+	imageName := refStr[repoPos+1 : tagPos]
+	tag := refStr[tagPos+1 : len(refStr)]
+	logrus.WithFields(logrus.Fields{
+		"repo":  repo,
+		"image": imageName,
+		"tag":   tag,
+	}).Info("[DEBUG]")
+
+	img, err := image.FromUnparsedImage(ctx, nil, image.UnparsedInstance(imgSrc, nil))
+	return img, err
+}
+
+func pullThread(ctx context.Context, idx int, pichan <-chan *pullInfo, wg *sync.WaitGroup) {
+	logrus.WithField("thread", idx).Info("thread started")
+	defer wg.Done()
+	for {
+		select {
+		case pi, ok := <-pichan:
+			if !ok {
+				logrus.Error("channel error")
+				return
+			}
+			logrus.WithField("layerInfo", pi.layerInfo).Infoln("pull layer")
+			logrus.WithField("path", pi.layerInfo.path).Infoln("pull layer")
+			err := pi.layerInfo.pullFunc()
+			if err != nil {
+				logrus.Errorf("error while pull: %+v", err)
+				return
+			}
+			pi.Conn.Close()
+		case <-ctx.Done():
+			logrus.WithField("thread", idx).Info("thread finished")
+			return
+		}
+	}
+}
+
+func waitRequest(ctx context.Context, conn net.Conn, pichan chan<- *pullInfo, wg *sync.WaitGroup, liMap map[string]*layerInfo) {
+	defer wg.Done()
+	buf := make([]byte, 128)
+	logrus.Info("waiting")
+
+	err := conn.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
+	if err != nil {
+		logrus.Error("conn.SetReadDeadline: %+v")
+	}
+
+	var key string
+	continue_read := true
+	for continue_read {
+		size, err := conn.Read(buf)
+		switch {
+		case err == nil:
+			logrus.Infof("read data=%s", buf)
+			key = string(buf[0:size])
+			continue_read = false
+		case os.IsTimeout(err):
+			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 500))
+		case errors.Is(err, io.EOF):
+			logrus.Errorf("read unexpected EOF: %+v", err)
+		default:
+			logrus.Errorf("read request error: %+v", err)
+		}
+		select {
+		case <-ctx.Done():
+			logrus.Infof("waitRequest canceled")
+			return
+		default:
+		}
+	}
+
+	pi := &pullInfo{}
+	pi.Conn = conn
+	logrus.WithFields(
+		logrus.Fields{
+			"key": key,
+			"len": len(key),
+		}).Info("info")
+	logrus.Info("get layer info")
+	li, ok := liMap[key]
+	if !ok {
+		logrus.Error("error get layer info")
+	}
+	logrus.Info("select start")
+	pi.layerInfo = li
+	select {
+	case pichan <- pi:
+		logrus.Info("pi sent")
+	case <-ctx.Done():
+		logrus.Info("ctx.Done")
+	}
+	logrus.Info("select done")
+}
+
+func generateLayerPullFunc(url, dstRoot string, dgst *digest.Digest) func() error {
+	var once sync.Once
+	f := func() error {
+		var err error = nil
+		once.Do(func() {
+			r, err := fetchBlobAsReader(url, dgst)
+			if err != nil {
+				return
+			}
+			err = untar(dstRoot, r)
+		})
+		return err
+	}
+	return f
+}
+
+func fetchBlobAsReader(url string, digest *digest.Digest) (io.ReadCloser, error) {
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		buf, err := httputil.DumpRequest(req, true)
+		if err != nil {
+			return nil, err
+		}
+		logrus.Debugf("%s", buf)
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		buf, err := httputil.DumpResponse(res, true)
+		if err != nil {
+			return nil, err
+		}
+		if len(buf) > 100 {
+			buf = buf[:100]
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", buf)
+	}
+
+	if res.StatusCode/100 != 2 {
+		return nil, xerrors.Errorf("status error of fetch blob: %s", res.Status)
+	}
+	return res.Body, nil
+}
+
+func untar(dstRootPath string, r io.Reader) error {
+	logrus.WithField("root", dstRootPath).Info("untar")
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+	tr := tar.NewReader(gzr)
+	for {
+		header, err := tr.Next()
+		switch {
+		case err == io.EOF:
+			return nil
+		case err != nil:
+			return err
+		case header == nil:
+			continue
+		}
+		target := filepath.Join(dstRootPath, header.Name)
+		// fi := header.FileInfo()
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				return err
+			}
+			f.Close()
+		}
+	}
 }
