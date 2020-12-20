@@ -74,4 +74,7 @@ require (
 	k8s.io/client-go v0.0.0-20190620085101-78d2af792bab
 )
 
-replace github.com/cri-o/ocicni => github.com/cri-o/ocicni v0.2.1-0.20201109200316-afdc16ba66df
+replace (
+	github.com/cri-o/ocicni => github.com/cri-o/ocicni v0.2.1-0.20201109200316-afdc16ba66df
+	github.com/progrunner17/llpfsutil => /home/vagrant/nfs/llpfsutil
+)

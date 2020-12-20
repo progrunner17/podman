@@ -1,6 +1,7 @@
 package containers
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"github.com/containers/podman/v2/pkg/specgen"
 	"github.com/containers/podman/v2/pkg/util"
 	"github.com/pkg/errors"
+	llpfslib "github.com/progrunner17/llpfsutil/lib"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -136,6 +138,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	imageName := args[0]
 	rawImageName := ""
+	cliVals.RootFS = true
 	if !cliVals.RootFS {
 		rawImageName = args[0]
 		name, err := pullImage(args[0])
@@ -144,6 +147,20 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 		imageName = name
 	}
+	ctx := registry.GetContext()
+	ctx, cancel := context.WithCancel(ctx)
+
+	img, err := llpfslib.GetImageFromName(ctx, imageName)
+	if err != nil {
+		return err
+	}
+	mntDir, finalize, err := llpfslib.MountImageAsRemoteOnTmp(ctx, img)
+	if err != nil {
+		return err
+	}
+	defer finalize()
+	defer cancel()
+	imageName = mntDir
 
 	if cliVals.Replace {
 		if err := replaceContainer(cliVals.Name); err != nil {
@@ -179,9 +196,37 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	cliVals.PreserveFDs = runOpts.PreserveFDs
 	s := specgen.NewSpecGenerator(imageName, cliVals.RootFS)
+	ociCfg, err := img.OCIConfig(ctx)
+	if err != nil {
+		return err
+	}
+	s.Rootfs = mntDir
+	logrus.WithField("Rootfs", s.Rootfs).Info("[DEBUG]")
+
+	if len(args) == 1 {
+		args = append(args, ociCfg.Config.Cmd...)
+	}
+	// 	logrus.WithField("command", os.Args).Info("[DEBUG]")
+	if cliVals.User == "" {
+		cliVals.User = ociCfg.Config.User
+	}
+	// 	if cliVals.Entrypoint == nil {
+	// 		cliVals.Entrypoint = ociCfg.Config.Entrypoint
+	// 	}
+	if cliVals.Workdir == "" {
+		cliVals.Workdir = ociCfg.Config.WorkingDir
+	}
+	cliVals.Env = append(ociCfg.Config.Env, cliVals.Env...)
+
 	if err := common.FillOutSpecGen(s, &cliVals, args); err != nil {
 		return err
 	}
+	logrus.WithField("workdir", s.WorkDir).Info("[DEBUG]")
+	logrus.WithField("user", s.User).Info("[DEBUG]")
+	logrus.WithField("env", s.Env).Info("[DEBUG]")
+	logrus.WithField("command2", s.Command).Info("[DEBUG]")
+	s.Entrypoint = ociCfg.Config.Entrypoint
+	logrus.WithField("entrypoint", s.Entrypoint).Info("[DEBUG]")
 	s.RawImageName = rawImageName
 	runOpts.Spec = s
 
