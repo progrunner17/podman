@@ -154,7 +154,15 @@ func run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	mntDir, finalize, err := llpfslib.MountImageAsRemoteOnTmp(ctx, img)
+	asyncStr, ok := os.LookupEnv("PODMAN_LAZY_PULL_ASYNC")
+	async := ok && asyncStr != "" && asyncStr != "0" && asyncStr != "false"
+	numThreadsStr, ok := os.LookupEnv("PODMAN_LAZY_PULL_THREADS")
+	numThreads, err := strconv.Atoi(numThreadsStr)
+	if err != nil || !ok {
+		numThreads = 1
+	}
+	llpfslib.SetMaxNumThread(numThreads)
+	mntDir, finalize, err := llpfslib.MountImageAsRemoteOnTmp(ctx, img, async)
 	if err != nil {
 		return err
 	}
